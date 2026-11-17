@@ -1,5 +1,13 @@
-<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>세로 영상 메이커</title>
+<link rel="icon" type="image/png" sizes="512x512" href="./icon.png">
+<link rel="apple-touch-icon" sizes="180x180" href="./icon.png">
+<link rel="apple-touch-icon" href="./icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="세로 영상 메이커">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#3d35c8"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -761,16 +769,57 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
 
   async function saveVideo() {
     if (!st.blob) return;
-    const d = await getDownloads();
-    if (!d) { $('saveHint').hidden = false; return; }
     const base = (st.audioName || 'video').replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]+/g, ' ').trim() || 'video';
+    const filename = base + '_9x16.' + st.ext;
+
+    // 1. Claude Artifacts 환경인 경우 기존 API 사용
+    const d = await getDownloads();
+    if (d) {
+      try {
+        await d.save({ filename: filename, data: st.blob });
+        setMsg('저장했어요.', 'ok');
+        return;
+      } catch (e) {
+        if (e && e.code === 'declined') { setMsg('저장을 취소했어요.'); return; }
+      }
+    }
+
+    // 2. 일반 웹 브라우저 및 아이폰 홈 화면 앱(Standalone PWA) 환경
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+
+    // iOS(특히 홈 화면에 추가한 웹앱)에서는 Web Share API로 '비디오 저장(사진 앱)' 또는 '파일에 저장'이 가장 확실하게 동작함
+    if (isIOS && navigator.share && navigator.canShare) {
+      try {
+        const file = new File([st.blob], filename, { type: st.blob.type || 'video/mp4' });
+        if (navigator.canShare({ files: [file] })) {
+          await navigator.share({ files: [file], title: filename });
+          setMsg('공유 창에서 "비디오 저장" 또는 "파일에 저장"을 눌러 저장하세요.', 'ok');
+          return;
+        }
+      } catch (e) {
+        if (e && e.name === 'AbortError') { setMsg('저장을 취소했어요.'); return; }
+      }
+    }
+
+    // 3. 표준 브라우저 다운로드 (<a download>) 폴백
     try {
-      await d.save({ filename: base + '_9x16.' + st.ext, data: st.blob });
-      setMsg('저장했어요.', 'ok');
+      const url = st.url || URL.createObjectURL(st.blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => document.body.removeChild(a), 200);
+      if (isIOS && isStandalone) {
+        setMsg('다운로드를 요청했어요. 저장이 안 되면 위 미리보기 영상을 길게 눌러 저장해 주세요.', 'ok');
+      } else {
+        setMsg('저장했어요. 다운로드 폴더를 확인해 주세요.', 'ok');
+      }
     } catch (e) {
-      if (e && e.code === 'declined') setMsg('저장을 취소했어요.');
-      else if (e && (e.code === 'unavailable' || e.code === 'not_granted')) $('saveHint').hidden = false;
-      else setMsg('저장하지 못했어요. ' + ((e && e.message) || ''), 'error');
+      $('saveHint').textContent = '자동 저장이 차단되었어요. 위 미리보기 영상을 길게 누르거나 공유 버튼을 이용해 저장해 주세요.';
+      $('saveHint').hidden = false;
     }
   }
 
