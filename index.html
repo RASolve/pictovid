@@ -566,25 +566,60 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
   /* ---------- making the video ---------- */
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  /* Audio resampling helper (e.g. 48kHz -> 44.1kHz or 48kHz stereo) for mobile WebCodecs compatibility */
+  async function prepareAudioBuffer(audioBuf, targetSr, targetCh) {
+    if (audioBuf.sampleRate === targetSr && audioBuf.numberOfChannels === targetCh) return audioBuf;
+    const lenSamples = Math.ceil(audioBuf.duration * targetSr);
+    const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!OfflineCtx) return audioBuf;
+    const off = new OfflineCtx(targetCh, lenSamples, targetSr);
+    const src = off.createBufferSource();
+    src.buffer = audioBuf;
+    src.connect(off.destination);
+    src.start(0);
+    return await off.startRendering();
+  }
+
   /* Fast path: encode frames and audio directly with WebCodecs, no waiting for playback. */
   async function fastConfig(r) {
     if (!(window.VideoEncoder && window.AudioEncoder && window.VideoFrame && window.AudioData && window.Mp4Muxer)) return null;
-    const ch = Math.min(2, st.audio.numberOfChannels), sr = st.audio.sampleRate;
+    const origCh = Math.min(2, st.audio.numberOfChannels), origSr = st.audio.sampleRate;
     let v = null;
     for (const codec of ['avc1.640028', 'avc1.4d0028', 'avc1.42E028']) {
       const c = { codec: codec, width: r.w, height: r.h, bitrate: r.fbps, framerate: FPS, bitrateMode: 'variable', avc: { format: 'avc' } };
       try { const s = await VideoEncoder.isConfigSupported(c); if (s && s.supported) { v = c; break; } } catch (e) {}
     }
     if (!v) return null;
-    let a = null;
-    const ac = { codec: 'mp4a.40.2', sampleRate: sr, numberOfChannels: ch, bitrate: 192000 };
-    try { const s = await AudioEncoder.isConfigSupported(ac); if (s && s.supported) a = { cfg: ac, mux: 'aac' }; } catch (e) {}
+
+    // 모바일(iOS WebKit / Android Chrome)에서는 특정 샘플레이트(예: 24kHz, 32kHz)나 모노 AAC 인코딩을 거부하는 경우가 많음
+    // 따라서 원본 (sr, ch) -> (48000, 2) -> (44100, 2) 순으로 지원하는 AAC 설정을 탐색
+    const candidates = [
+      { sr: origSr, ch: origCh },
+      { sr: 48000, ch: 2 },
+      { sr: 44100, ch: 2 },
+      { sr: 48000, ch: 1 },
+      { sr: 44100, ch: 1 }
+    ];
+    let a = null, chosenSr = origSr, chosenCh = origCh;
+    for (const cand of candidates) {
+      const ac = { codec: 'mp4a.40.2', sampleRate: cand.sr, numberOfChannels: cand.ch, bitrate: 192000 };
+      try {
+        const s = await AudioEncoder.isConfigSupported(ac);
+        if (s && s.supported) {
+          a = { cfg: s.config || ac, mux: 'aac' };
+          chosenSr = cand.sr;
+          chosenCh = cand.ch;
+          break;
+        }
+      } catch (e) {}
+    }
     if (!a) return null;
-    return { v: v, a: a, ch: ch, sr: sr };
+    return { v: v, a: a, ch: chosenCh, sr: chosenSr };
   }
 
   async function encodeFast(cfg, cache, range, r) {
     const ch = cfg.ch, sr = cfg.sr, len = range.len;
+    const workAudio = await prepareAudioBuffer(st.audio, sr, ch);
     const target = new Mp4Muxer.ArrayBufferTarget();
     const muxer = new Mp4Muxer.Muxer({
       target: target,
@@ -598,8 +633,14 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
     const ae = new AudioEncoder({
       output: (c, m) => {
         if (!audioCfgOk) {
-          if (!(m && m.decoderConfig && m.decoderConfig.description)) { err = new Error('aac config missing'); return; }
-          audioCfgOk = true;
+          // iOS Safari/Chrome WebKit에서는 decoderConfig.description이 비어 있을 수 있으므로
+          // 유효한 decoderConfig가 있거나 첫 청크가 정상 출력되면 통과시킴
+          if (m && m.decoderConfig) {
+            audioCfgOk = true;
+          } else {
+            m = { decoderConfig: { codec: 'mp4a.40.2', sampleRate: sr, numberOfChannels: ch } };
+            audioCfgOk = true;
+          }
         }
         audioChunks++;
         muxer.addAudioChunk(c, m);
@@ -610,9 +651,9 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
 
     const total = Math.max(1, Math.round(len * FPS));
     const startSample = Math.round(range.s * sr);
-    const endSample = Math.min(st.audio.length, startSample + Math.round(len * sr));
+    const endSample = Math.min(workAudio.length, startSample + Math.round(len * sr));
     const chans = [];
-    for (let c = 0; c < ch; c++) chans.push(st.audio.getChannelData(c));
+    for (let c = 0; c < ch; c++) chans.push(workAudio.getChannelData(Math.min(c, workAudio.numberOfChannels - 1)));
     const base = new VideoFrame(cache, { timestamp: 0 });
     let fi = 0, ai = startSample;
     try {
@@ -620,7 +661,8 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
         if (st.cancel) break;
         if (err) throw err;
         if (ai < endSample) {
-          const n = Math.min(sr, endSample - ai);
+          // 모바일 하드웨어 AAC 인코더는 1024 샘플 프레임 단위로 넣을 때 가장 안정적임
+          const n = Math.min(1024, endSample - ai);
           const data = new Float32Array(n * ch);
           for (let c = 0; c < ch; c++) data.set(chans[c].subarray(ai, ai + n), c * n);
           const ad = new AudioData({ format: 'f32-planar', sampleRate: sr, numberOfFrames: n, numberOfChannels: ch, timestamp: Math.round((ai - startSample) / sr * 1e6), data: data });
@@ -633,8 +675,10 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
           vf.close(); fi++;
           while (ve.encodeQueueSize > 30 && !st.cancel && !err) await sleep(2);
         }
-        updateProgress(Math.min(1, fi / total), '변환 중 ' + Math.round(Math.min(1, fi / total) * 100) + '%');
-        await sleep(0);
+        if (fi % 5 === 0 || ai >= endSample) {
+          updateProgress(Math.min(1, fi / total), '변환 중 ' + Math.round(Math.min(1, fi / total) * 100) + '%');
+          await sleep(0);
+        }
       }
       if (st.cancel) return null;
       if (err) throw err;
@@ -652,7 +696,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
 
   /* Fallback: play the audio into a MediaRecorder, which takes as long as the clip itself. */
   function pickMime() {
-    const list = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4;codecs=avc1.640028,mp4a.40.2',
+    const list = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4;codecs=avc1.640028,mp4a.40.2', 'video/mp4',
       'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
     for (const m of list) { try { if (MediaRecorder.isTypeSupported(m)) return m; } catch (e) {} }
     return '';
@@ -662,11 +706,20 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
     const w = r.w, h = r.h, len = range.len;
     const actx = getActx();
     try { await actx.resume(); } catch (e) {}
-    let rec, vs, src, mime = pickMime();
+    let rec, vs, src, silentGain, mime = pickMime();
     try {
       const dest = actx.createMediaStreamDestination();
       src = actx.createBufferSource();
-      src.buffer = st.audio; src.connect(dest);
+      src.buffer = st.audio;
+      src.connect(dest);
+
+      // 모바일 iOS/Android 브라우저에서는 AudioContext 그래프가 스피커(destination)에도 연결되어야
+      // 하드웨어 오디오 렌더링 스레드가 절전/무음 처리되지 않고 정상적으로 스트림에 데이터를 흘려보냄
+      silentGain = actx.createGain();
+      silentGain.gain.value = 0.0001;
+      src.connect(silentGain);
+      silentGain.connect(actx.destination);
+
       vs = canvas.captureStream(FPS);
       const stream = new MediaStream(vs.getVideoTracks().concat(dest.stream.getAudioTracks()));
       const opts = { videoBitsPerSecond: r.bps, audioBitsPerSecond: 192000 };
@@ -702,7 +755,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
     clearInterval(timer);
     if (rec.state !== 'inactive') rec.stop();
     await stopped;
-    try { vs.getTracks().forEach((t) => t.stop()); src.disconnect(); } catch (e) {}
+    try { vs.getTracks().forEach((t) => t.stop()); src.disconnect(); if (silentGain) silentGain.disconnect(); } catch (e) {}
     try { if (wake && wake.release) wake.release(); } catch (e) {}
     st.stopAudio = null;
     if (st.cancel) return null;
@@ -710,11 +763,16 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
     const blob = new Blob(chunks, { type: type });
     if (blob.size < 2000) { setMsg('영상을 만들지 못했어요. 해상도를 낮추거나 다른 브라우저에서 다시 시도해 주세요.', 'error'); return null; }
     const used = (rec.mimeType || mime || '').toLowerCase();
-    return { blob: blob, ext: type.indexOf('mp4') >= 0 ? 'mp4' : 'webm', audio: used.indexOf('mp4a') >= 0 ? 'AAC' : 'Opus', realtime: true };
+    return { blob: blob, ext: type.indexOf('mp4') >= 0 ? 'mp4' : 'webm', audio: (type.indexOf('mp4') >= 0 || used.indexOf('mp4a') >= 0) ? 'AAC' : 'Opus', realtime: true };
   }
 
   async function makeVideo() {
     if (st.recording || !st.image || !st.audio) return;
+    // 모바일 브라우저 자동재생 정책 해제: 사용자 클릭 직후 즉시 AudioContext를 resume()
+    try {
+      const actx = getActx();
+      if (actx.state === 'suspended') await actx.resume();
+    } catch (e) {}
     clearResult(); setMsg('');
     const r = RES[resKey()], w = r.w, h = r.h;
     compose();
