@@ -566,7 +566,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
   /* ---------- making the video ---------- */
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  /* ISO/IEC 14496-3 AudioSpecificConfig (2 bytes) for AAC-LC (esds descriptor required by iOS AVFoundation) */
+  /* ISO/IEC 14496-3 AudioSpecificConfig (2 bytes) for AAC-LC */
   function buildAacDescription(sr, ch) {
     const rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
     let srIdx = rates.indexOf(sr);
@@ -575,6 +575,31 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
     const b0 = (objType << 3) | (srIdx >> 1);
     const b1 = ((srIdx & 1) << 7) | ((ch & 0x0F) << 3);
     return new Uint8Array([b0, b1]);
+  }
+
+  /* Extract clean 2-byte AudioSpecificConfig even if WebKit passes a full 39-byte ES_Descriptor (0x03...) */
+  function extractCleanAacConfig(desc, sr, ch) {
+    if (desc) {
+      const bytes = desc instanceof ArrayBuffer
+        ? new Uint8Array(desc)
+        : (ArrayBuffer.isView(desc) ? new Uint8Array(desc.buffer, desc.byteOffset, desc.byteLength) : new Uint8Array(desc));
+      if (bytes.length >= 2 && bytes.length <= 8 && bytes[0] !== 0x03) {
+        return bytes;
+      }
+      if (bytes.length > 8 && bytes[0] === 0x03) {
+        for (let i = 2; i < bytes.length - 3; i++) {
+          if (bytes[i] === 0x05) {
+            let len = 0, j = i + 1;
+            while (j < bytes.length && (bytes[j] & 0x80)) { len = (len << 7) | (bytes[j] & 0x7F); j++; }
+            if (j < bytes.length) { len = (len << 7) | (bytes[j] & 0x7F); j++; }
+            if (len >= 2 && len <= 8 && j + len <= bytes.length) {
+              return bytes.slice(j, j + len);
+            }
+          }
+        }
+      }
+    }
+    return buildAacDescription(sr, ch);
   }
 
   /* Audio resampling & clipping helper using OfflineAudioContext */
@@ -600,6 +625,30 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
       out.getChannelData(c).set(srcCh.subarray(s0, s0 + n0));
     }
     return out;
+  }
+
+  function audioBufferToWavBlob(buf) {
+    const ch = buf.numberOfChannels, sr = buf.sampleRate, n = buf.length;
+    const dataBytes = n * ch * 2;
+    const ab = new ArrayBuffer(44 + dataBytes);
+    const v = new DataView(ab);
+    const wStr = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+    wStr(0, 'RIFF'); v.setUint32(4, 36 + dataBytes, true); wStr(8, 'WAVE');
+    wStr(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+    v.setUint16(22, ch, true); v.setUint32(24, sr, true);
+    v.setUint32(28, sr * ch * 2, true); v.setUint16(32, ch * 2, true); v.setUint16(34, 16, true);
+    wStr(36, 'data'); v.setUint32(40, dataBytes, true);
+    const chans = [];
+    for (let c = 0; c < ch; c++) chans.push(buf.getChannelData(c));
+    let pos = 44;
+    for (let i = 0; i < n; i++) {
+      for (let c = 0; c < ch; c++) {
+        const s = Math.max(-1, Math.min(1, chans[c][i]));
+        v.setInt16(pos, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        pos += 2;
+      }
+    }
+    return new Blob([ab], { type: 'audio/wav' });
   }
 
   /* Fast path: encode frames and audio directly with WebCodecs, no waiting for playback. */
@@ -649,10 +698,11 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
       firstTimestampBehavior: 'offset'
     });
     let err = null, audioChunks = 0, audioCfgOk = false;
+    const frameDurUs = Math.round(1024 / sr * 1e6);
     const ve = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: (e) => { err = e; } });
     const ae = new AudioEncoder({
       output: (c, m) => {
-        // 1. Strip 7/9-byte ADTS header if iOS WebKit prepended it to raw AAC frame
+        // 1. Copy raw AAC bytes & strip 7/9-byte ADTS header if iOS WebKit prepended it
         const raw = new Uint8Array(c.byteLength);
         c.copyTo(raw);
         let payload = raw;
@@ -664,17 +714,23 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
             payload = raw.subarray(headerLen);
           }
         }
+
+        // 2. Skip iOS WebKit's 6-byte empty AAC priming packets (21 20 03 40 68 1c) that cause iOS AVFoundation to mute the audio track
+        if (payload.length <= 16) return;
+
+        // 3. Re-index timestamps monotonically from 0 so iOS AVFoundation sees a seamless stream
+        const tsUs = audioChunks * frameDurUs;
         const cleanChunk = (typeof EncodedAudioChunk === 'function')
           ? new EncodedAudioChunk({
-              type: c.type || 'key',
-              timestamp: c.timestamp,
-              duration: c.duration || 0,
+              type: 'key',
+              timestamp: tsUs,
+              duration: frameDurUs,
               data: payload
             })
           : {
-              type: c.type || 'key',
-              timestamp: c.timestamp,
-              duration: c.duration || 0,
+              type: 'key',
+              timestamp: tsUs,
+              duration: frameDurUs,
               byteLength: payload.byteLength,
               copyTo: (dest) => {
                 const view = dest instanceof ArrayBuffer
@@ -684,38 +740,16 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
               }
             };
 
-        // 2. Fix iOS WebKit bug where decoderConfig.description is a 39-byte full ES_Descriptor (0x03...)
-        // instead of the 2-byte AudioSpecificConfig (e.g. 0x11 0x90), which caused double-wrapped esds & 0 channels
-        const meta = m ? Object.assign({}, m) : {};
+        // 4. Read m.decoderConfig directly (avoiding Object.assign on WebIDL host object) & attach clean 2-byte AudioSpecificConfig
+        const rawDesc = (m && m.decoderConfig) ? m.decoderConfig.description : null;
+        const meta = {};
         if (!audioCfgOk) {
-          let validDesc = null;
-          const desc = meta.decoderConfig && meta.decoderConfig.description;
-          if (desc) {
-            const bytes = desc instanceof ArrayBuffer
-              ? new Uint8Array(desc)
-              : (ArrayBuffer.isView(desc) ? new Uint8Array(desc.buffer, desc.byteOffset, desc.byteLength) : new Uint8Array(desc));
-            if (bytes.length >= 2 && bytes.length <= 8 && bytes[0] !== 0x03) {
-              validDesc = bytes;
-            } else if (bytes.length > 8 && bytes[0] === 0x03) {
-              for (let i = 2; i < bytes.length - 3; i++) {
-                if (bytes[i] === 0x05) {
-                  let len = 0, j = i + 1;
-                  while (j < bytes.length && (bytes[j] & 0x80)) { len = (len << 7) | (bytes[j] & 0x7F); j++; }
-                  if (j < bytes.length) { len = (len << 7) | (bytes[j] & 0x7F); j++; }
-                  if (len >= 2 && len <= 8 && j + len <= bytes.length) {
-                    validDesc = bytes.slice(j, j + len);
-                    break;
-                  }
-                }
-              }
-            }
-          }
-          meta.decoderConfig = Object.assign({}, meta.decoderConfig || {}, {
+          meta.decoderConfig = {
             codec: 'mp4a.40.2',
             sampleRate: sr,
             numberOfChannels: ch,
-            description: validDesc || buildAacDescription(sr, ch)
-          });
+            description: extractCleanAacConfig(rawDesc, sr, ch)
+          };
           audioCfgOk = true;
         }
         audioChunks++;
@@ -768,9 +802,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
     }
   }
 
-  /* Fallback: play the audio into a MediaRecorder.
-     On iOS Chrome/Safari (WebKit), createMediaStreamDestination() often records silence due to WebKit bug #215763 / #238391.
-     Using HTMLAudioElement.captureStream() / mozCaptureStream() (with WebAudio fallback) ensures real audio tracks on mobile! */
+  /* Fallback: play the audio into a MediaRecorder. */
   function pickMime() {
     const list = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4;codecs=avc1.640028,mp4a.40.2', 'video/mp4',
       'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
@@ -782,7 +814,6 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
     const len = range.len;
     updateProgress(0, '오디오 준비 중...');
 
-    // 1. Cut exact clip & generate WAV Blob URL
     const clipBuf = await extractClipBuffer(st.audio, range.s, len, 44100, 2);
     const wavBlob = audioBufferToWavBlob(clipBuf);
     const wavUrl = URL.createObjectURL(wavBlob);
@@ -791,7 +822,6 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
     const mime = pickMime();
 
     try {
-      // Method A: HTMLAudioElement.captureStream() — bypasses iOS WebKit WebAudio MediaStreamDestination silence bug!
       audioEl = document.createElement('audio');
       audioEl.src = wavUrl;
       audioEl.preload = 'auto';
@@ -806,14 +836,12 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
 
       const capFn = audioEl.captureStream || audioEl.mozCaptureStream;
       if (typeof capFn === 'function') {
-        // Start playback briefly or capture stream
         audioStream = capFn.call(audioEl);
       }
     } catch (e) {
       audioStream = null;
     }
 
-    // Method B: WebAudio MediaStreamDestination fallback (if browser lacks HTMLAudioElement.captureStream)
     if (!audioStream || audioStream.getAudioTracks().length === 0) {
       if (audioEl) { try { audioEl.pause(); audioEl.removeAttribute('src'); } catch (e) {} audioEl = null; }
       actx = getActx();
@@ -905,7 +933,6 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
 
   async function makeVideo() {
     if (st.recording || !st.image || !st.audio) return;
-    // 모바일 브라우저 자동재생 정책 해제: 사용자 클릭 직후 즉시 AudioContext를 resume()
     try {
       const actx = getActx();
       if (actx.state === 'suspended') await actx.resume();
@@ -944,6 +971,8 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
     st.blob = res.blob; st.ext = res.ext;
     st.url = URL.createObjectURL(res.blob);
     video.src = st.url;
+    video.muted = false;
+    video.volume = 1.0;
     video.hidden = false; canvas.hidden = true;
     $('result').hidden = false;
     $('webmHint').hidden = res.ext === 'mp4';
