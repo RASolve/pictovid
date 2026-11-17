@@ -353,7 +353,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
   function setMsg(text, kind) { const m = $('msg'); m.textContent = text || ''; m.dataset.kind = kind || ''; }
   function resKey() { return document.querySelector('input[name="res"]:checked').value; }
 
-  /* ---------- sample image (drawn in code, shown until the user adds their own) ---------- */
+  /* ---------- sample image ---------- */
   function makeSample() {
     const S = 1000, c = document.createElement('canvas');
     c.width = c.height = S;
@@ -566,7 +566,17 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
   /* ---------- making the video ---------- */
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  /* Audio resampling & clipping helper using OfflineAudioContext */
+  /* ISO/IEC 14496-3 AudioSpecificConfig (2 bytes) for AAC-LC (esds descriptor required by iOS AVFoundation) */
+  function buildAacDescription(sr, ch) {
+    const rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+    let srIdx = rates.indexOf(sr);
+    if (srIdx < 0) srIdx = 4; // 44100Hz fallback
+    const objType = 2; // AAC-LC
+    const b0 = (objType << 3) | (srIdx >> 1);
+    const b1 = ((srIdx & 1) << 7) | ((ch & 0x0F) << 3);
+    return new Uint8Array([b0, b1]);
+  }
+
   async function extractClipBuffer(audioBuf, startSec, lenSec, targetSr, targetCh) {
     const sr = targetSr || audioBuf.sampleRate;
     const ch = targetCh || Math.min(2, audioBuf.numberOfChannels);
@@ -580,7 +590,6 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
       src.start(0, startSec, lenSec);
       return await off.startRendering();
     }
-    // Fallback manual slice
     const s0 = Math.round(startSec * audioBuf.sampleRate);
     const n0 = Math.min(audioBuf.length - s0, Math.round(lenSec * audioBuf.sampleRate));
     const actx = getActx();
@@ -592,7 +601,6 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
     return out;
   }
 
-  /* Fast path: encode frames and audio directly with WebCodecs, no waiting for playback. */
   async function fastConfig(r) {
     if (!(window.VideoEncoder && window.AudioEncoder && window.VideoFrame && window.AudioData && window.Mp4Muxer)) return null;
     const origCh = Math.min(2, st.audio.numberOfChannels), origSr = st.audio.sampleRate;
@@ -604,9 +612,9 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
     if (!v) return null;
 
     const candidates = [
-      { sr: origSr, ch: origCh },
       { sr: 48000, ch: 2 },
       { sr: 44100, ch: 2 },
+      { sr: origSr, ch: origCh },
       { sr: 48000, ch: 1 },
       { sr: 44100, ch: 1 }
     ];
@@ -642,16 +650,53 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
     const ve = new VideoEncoder({ output: (c, m) => muxer.addVideoChunk(c, m), error: (e) => { err = e; } });
     const ae = new AudioEncoder({
       output: (c, m) => {
-        if (!audioCfgOk) {
-          if (m && m.decoderConfig) {
-            audioCfgOk = true;
-          } else {
-            m = { decoderConfig: { codec: 'mp4a.40.2', sampleRate: sr, numberOfChannels: ch } };
-            audioCfgOk = true;
+        // 1. Extract raw bytes & strip 7/9-byte ADTS header if iOS WebKit prepended it
+        const raw = new Uint8Array(c.byteLength);
+        c.copyTo(raw);
+        let payload = raw;
+        if (raw.length >= 7 && raw[0] === 0xFF && (raw[1] & 0xF0) === 0xF0) {
+          const hasCrc = (raw[1] & 0x01) === 0;
+          const headerLen = hasCrc ? 9 : 7;
+          const adtsLen = ((raw[3] & 0x03) << 11) | (raw[4] << 3) | ((raw[5] & 0xE0) >> 5);
+          if (adtsLen === raw.length && raw.length > headerLen) {
+            payload = raw.subarray(headerLen);
           }
         }
+        const cleanChunk = (typeof EncodedAudioChunk === 'function')
+          ? new EncodedAudioChunk({
+              type: c.type || 'key',
+              timestamp: c.timestamp,
+              duration: c.duration || 0,
+              data: payload
+            })
+          : {
+              type: c.type || 'key',
+              timestamp: c.timestamp,
+              duration: c.duration || 0,
+              byteLength: payload.byteLength,
+              copyTo: (dest) => {
+                const view = dest instanceof ArrayBuffer
+                  ? new Uint8Array(dest)
+                  : new Uint8Array(dest.buffer, dest.byteOffset, dest.byteLength);
+                view.set(payload);
+              }
+            };
+
+        // 2. Ensure valid 2-byte AudioSpecificConfig (esds) is attached on first chunk for iOS AVFoundation
+        const meta = m ? Object.assign({}, m) : {};
+        if (!audioCfgOk) {
+          const desc = meta.decoderConfig && meta.decoderConfig.description;
+          const hasValidDesc = desc && ((desc.byteLength && desc.byteLength > 0) || (desc.length && desc.length > 0));
+          meta.decoderConfig = Object.assign({}, meta.decoderConfig || {}, {
+            codec: 'mp4a.40.2',
+            sampleRate: sr,
+            numberOfChannels: ch,
+            description: hasValidDesc ? desc : buildAacDescription(sr, ch)
+          });
+          audioCfgOk = true;
+        }
         audioChunks++;
-        muxer.addAudioChunk(c, m);
+        muxer.addAudioChunk(cleanChunk, meta);
       },
       error: (e) => { err = e; }
     });
@@ -700,46 +745,7 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
     }
   }
 
-  /* Pure-JS PCM to WAV encoder for reliable <audio> element capture on iOS/Android Chrome */
-  function audioBufferToWavBlob(buf) {
-    const numCh = Math.min(2, buf.numberOfChannels);
-    const sr = buf.sampleRate;
-    const len = buf.length;
-    const dataSize = len * numCh * 2;
-    const ab = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(ab);
-    const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
-    writeStr(0, 'RIFF');
-    view.setUint32(4, 36 + dataSize, true);
-    writeStr(8, 'WAVE');
-    writeStr(12, 'fmt ');
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true); // PCM
-    view.setUint16(22, numCh, true);
-    view.setUint32(24, sr, true);
-    view.setUint32(28, sr * numCh * 2, true);
-    view.setUint16(32, numCh * 2, true);
-    view.setUint16(34, 16, true);
-    writeStr(36, 'data');
-    view.setUint32(40, dataSize, true);
-
-    const chans = [];
-    for (let c = 0; c < numCh; c++) chans.push(buf.getChannelData(Math.min(c, buf.numberOfChannels - 1)));
-    let off = 44;
-    for (let i = 0; i < len; i++) {
-      for (let c = 0; c < numCh; c++) {
-        let s = chans[c][i];
-        if (s > 1) s = 1; else if (s < -1) s = -1;
-        view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-        off += 2;
-      }
-    }
-    return new Blob([ab], { type: 'audio/wav' });
-  }
-
-  /* Fallback: play the audio into a MediaRecorder.
-     On iOS Chrome/Safari (WebKit), createMediaStreamDestination() often records silence due to WebKit bug #215763 / #238391.
-     Using HTMLAudioElement.captureStream() / mozCaptureStream() (with WebAudio fallback) ensures real audio tracks on mobile! */
+  /* Fallback: realtime MediaRecorder */
   function pickMime() {
     const list = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4;codecs=avc1.640028,mp4a.40.2', 'video/mp4',
       'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
@@ -749,70 +755,29 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
   async function recordRealtime(cache, range, r) {
     if (!supported) { setMsg('이 브라우저에서는 영상을 만들 수 없어요. 크롬, 엣지, 사파리 최신 버전에서 열어 주세요.', 'error'); return null; }
     const len = range.len;
-    updateProgress(0, '오디오 준비 중...');
-
-    // 1. Cut exact clip & generate WAV Blob URL
-    const clipBuf = await extractClipBuffer(st.audio, range.s, len, 44100, 2);
-    const wavBlob = audioBufferToWavBlob(clipBuf);
-    const wavUrl = URL.createObjectURL(wavBlob);
-
-    let rec = null, vs = null, audioEl = null, audioStream = null, actx = null, src = null, silentGain = null;
-    const mime = pickMime();
-
+    const actx = getActx();
+    try { await actx.resume(); } catch (e) {}
+    let rec, vs, src, silentGain, mime = pickMime();
     try {
-      // Method A: HTMLAudioElement.captureStream() — bypasses iOS WebKit WebAudio MediaStreamDestination silence bug!
-      audioEl = document.createElement('audio');
-      audioEl.src = wavUrl;
-      audioEl.preload = 'auto';
-      audioEl.playsInline = true;
-      audioEl.muted = false;
-      audioEl.volume = 1.0;
-
-      await new Promise((res, rej) => {
-        audioEl.onloadedmetadata = res;
-        audioEl.onerror = () => rej(new Error('audio load failed'));
-      });
-
-      const capFn = audioEl.captureStream || audioEl.mozCaptureStream;
-      if (typeof capFn === 'function') {
-        // Start playback briefly or capture stream
-        audioStream = capFn.call(audioEl);
-      }
-    } catch (e) {
-      audioStream = null;
-    }
-
-    // Method B: WebAudio MediaStreamDestination fallback (if browser lacks HTMLAudioElement.captureStream)
-    if (!audioStream || audioStream.getAudioTracks().length === 0) {
-      if (audioEl) { try { audioEl.pause(); audioEl.removeAttribute('src'); } catch (e) {} audioEl = null; }
-      actx = getActx();
-      try { await actx.resume(); } catch (e) {}
       const dest = actx.createMediaStreamDestination();
       src = actx.createBufferSource();
-      src.buffer = clipBuf;
+      src.buffer = st.audio;
       src.connect(dest);
 
       silentGain = actx.createGain();
-      silentGain.gain.value = 0.001;
+      silentGain.gain.value = 0.0001;
       src.connect(silentGain);
       silentGain.connect(actx.destination);
 
-      audioStream = dest.stream;
-    }
-
-    try {
       vs = canvas.captureStream(FPS);
-      const tracks = vs.getVideoTracks().concat(audioStream.getAudioTracks());
-      const stream = new MediaStream(tracks);
+      const stream = new MediaStream(vs.getVideoTracks().concat(dest.stream.getAudioTracks()));
       const opts = { videoBitsPerSecond: r.bps, audioBitsPerSecond: 192000 };
       if (mime) opts.mimeType = mime;
       rec = new MediaRecorder(stream, opts);
     } catch (e) {
-      URL.revokeObjectURL(wavUrl);
       setMsg('영상 녹화를 시작하지 못했어요. 다른 브라우저에서 다시 시도해 주세요.', 'error');
       return null;
     }
-
     const chunks = [];
     rec.ondataavailable = (ev) => { if (ev.data && ev.data.size) chunks.push(ev.data); };
     const stopped = new Promise((res) => { rec.onstop = res; });
@@ -820,50 +785,28 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
 
     let wake = null;
     try { if (navigator.wakeLock) wake = await navigator.wakeLock.request('screen'); } catch (e) {}
-    const vtrack = vs.getVideoTracks()[0];
-
-    const ended = new Promise((res) => {
-      if (audioEl) audioEl.onended = res;
-      else if (src) src.onended = res;
-      else setTimeout(res, len * 1000);
-    });
-    st.stopAudio = () => {
-      try { if (audioEl) audioEl.pause(); } catch (e) {}
-      try { if (src) src.stop(); } catch (e) {}
-    };
+    const track = vs.getVideoTracks()[0];
+    const ended = new Promise((res) => { src.onended = res; });
+    st.stopAudio = () => { try { src.stop(); } catch (e) {} };
 
     rec.start(1000);
     const t0 = performance.now();
     const timer = setInterval(() => {
       ctx.drawImage(cache, 0, 0);
-      try { if (vtrack && vtrack.requestFrame) vtrack.requestFrame(); } catch (e) {}
+      try { if (track.requestFrame) track.requestFrame(); } catch (e) {}
       const e = Math.min((performance.now() - t0) / 1000, len);
       updateProgress(e / len, '녹화 중 ' + fmt(e) + ' / ' + fmt(len));
     }, 1000 / FPS);
-
-    if (audioEl) {
-      try { await audioEl.play(); } catch (e) {}
-    } else if (src) {
-      src.start(0);
-    }
+    src.start(0, range.s, len);
 
     await Promise.race([ended, sleep(len * 1000 + 3000)]);
-    await sleep(300);
+    await sleep(250);
     clearInterval(timer);
     if (rec.state !== 'inactive') rec.stop();
     await stopped;
-
-    try {
-      vs.getTracks().forEach((t) => t.stop());
-      if (audioStream) audioStream.getTracks().forEach((t) => t.stop());
-      if (audioEl) { audioEl.pause(); audioEl.removeAttribute('src'); audioEl.load(); }
-      if (src) src.disconnect();
-      if (silentGain) silentGain.disconnect();
-    } catch (e) {}
-    URL.revokeObjectURL(wavUrl);
+    try { vs.getTracks().forEach((t) => t.stop()); src.disconnect(); if (silentGain) silentGain.disconnect(); } catch (e) {}
     try { if (wake && wake.release) wake.release(); } catch (e) {}
     st.stopAudio = null;
-
     if (st.cancel) return null;
     const type = ((rec.mimeType || mime || 'video/webm').split(';')[0]) || 'video/webm';
     const blob = new Blob(chunks, { type: type });
@@ -874,7 +817,6 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
 
   async function makeVideo() {
     if (st.recording || !st.image || !st.audio) return;
-    // 모바일 브라우저 자동재생 정책 해제: 사용자 클릭 직후 즉시 AudioContext를 resume()
     try {
       const actx = getActx();
       if (actx.state === 'suspended') await actx.resume();
@@ -936,7 +878,6 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
     const base = (st.audioName || 'video').replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]+/g, ' ').trim() || 'video';
     const filename = base + '_9x16.' + st.ext;
 
-    // 1. Claude Artifacts 환경인 경우 기존 API 사용
     const d = await getDownloads();
     if (d) {
       try {
@@ -948,11 +889,9 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
       }
     }
 
-    // 2. 일반 웹 브라우저 및 아이폰 홈 화면 앱(Standalone PWA) 환경
     const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
     const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
 
-    // iOS(특히 홈 화면에 추가한 웹앱)에서는 Web Share API로 '비디오 저장(사진 앱)' 또는 '파일에 저장'이 가장 확실하게 동작함
     if (isIOS && navigator.share && navigator.canShare) {
       try {
         const file = new File([st.blob], filename, { type: st.blob.type || 'video/mp4' });
@@ -966,7 +905,6 @@ input[type="range"] { width: 100%; accent-color: var(--accent); min-height: 28px
       }
     }
 
-    // 3. 표준 브라우저 다운로드 (<a download>) 폴백
     try {
       const url = st.url || URL.createObjectURL(st.blob);
       const a = document.createElement('a');
